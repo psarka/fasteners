@@ -14,7 +14,7 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-
+import abc
 from contextlib import contextmanager
 import errno
 import functools
@@ -22,10 +22,26 @@ import logging
 import os
 import threading
 import time
+import warnings
 
 from fasteners import _utils
 
 LOG = logging.getLogger(__name__)
+
+try:
+    from fasteners import pywin32
+except Exception:  # noqa
+    pywin32 = None
+
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 
 def _ensure_tree(path):
@@ -49,7 +65,122 @@ def _ensure_tree(path):
         return True
 
 
-class _InterProcessLock(object):
+# Locking mechanisms
+
+class Mechanism(abc.ABC):
+
+    @staticmethod
+    @abc.abstractmethod
+    def lock(handle, exclusive: bool):
+        ...
+
+    @staticmethod
+    @abc.abstractmethod
+    def unlock(handle):
+        ...
+
+
+class FcntlMechanism(Mechanism):
+
+    def __init__(self):
+        if fcntl is None:
+            raise OSError('This operating system does not support fcntl locking mechanism!')
+
+    @staticmethod
+    def lock(handle, exclusive):
+
+        if exclusive:
+            flags = fcntl.LOCK_EX | fcntl.LOCK_NB
+        else:
+            flags = fcntl.LOCK_SH | fcntl.LOCK_NB
+
+        try:
+            fcntl.lockf(handle, flags)
+            return True
+        except (IOError, OSError) as e:
+            if e.errno in (errno.EACCES, errno.EAGAIN):
+                return False
+            else:
+                raise e
+
+    @staticmethod
+    def unlock(handle):
+        fcntl.lockf(handle, fcntl.LOCK_UN)
+
+
+# TODO _mechanism
+# TODO lockfile
+
+class LockFileExMechanism(Mechanism):
+
+    def __init__(self):
+
+        if pywin32 is None:
+            raise OSError('This operating system does not support pywin32 and hence LockFileEx locking mechanism!')
+
+        if msvcrt is None:
+            raise OSError('This operating system does not support msvcrt and hence LockFileEx locking mechanism!')
+
+    @staticmethod
+    def lock(handle, exclusive):
+
+        if exclusive:
+            flags = pywin32.win32con.LOCKFILE_FAIL_IMMEDIATELY | pywin32.win32con.LOCKFILE_EXCLUSIVE_LOCK
+        else:
+            flags = pywin32.win32con.LOCKFILE_FAIL_IMMEDIATELY
+
+        handle = msvcrt.get_osfhandle(handle.fileno())
+        pointer = pywin32.win32file.pointer(pywin32.pywintypes.OVERLAPPED())
+        ok = pywin32.win32file.LockFileEx(handle, flags, 0, 1, 0, pointer)
+        if ok:
+            return True
+        else:
+            last_error = pywin32.win32file.GetLastError()
+            if last_error == pywin32.win32file.ERROR_LOCK_VIOLATION:
+                return False
+            else:
+                raise OSError(last_error)
+
+    @staticmethod
+    def unlock(handle):
+        handle = msvcrt.get_osfhandle(handle.fileno())
+        pointer = pywin32.win32file.pointer(pywin32.pywintypes.OVERLAPPED())
+        ok = pywin32.win32file.UnlockFileEx(handle, 0, 1, 0, pointer)
+        if not ok:
+            raise OSError(pywin32.win32file.GetLastError())
+
+
+class MSVCRTMechanism(Mechanism):
+
+    def __init__(self):
+        if pywin32 is None:
+            raise OSError('This operating system does not support msvcrt locking mechanism!')
+
+    @staticmethod
+    def lock(handle, exclusive):
+        if not exclusive:
+            raise ValueError('msvcrt does not support shared locks!')
+
+        fileno = handle.fileno()
+        msvcrt.locking(fileno, msvcrt.LK_NBLCK, 1)
+
+    @staticmethod
+    def unlock(handle):
+        fileno = handle.fileno()
+        msvcrt.locking(fileno, msvcrt.LK_UNLCK, 1)
+
+
+# class FlockMechanism(Mechanism):
+#     pass
+
+
+# class OpenMechanism(Mechanism):
+#     pass
+
+
+# -- Locks
+
+class BaseInterProcessLock(object):
     """An interprocess lock."""
 
     MAX_DELAY = 0.1
@@ -66,32 +197,28 @@ class _InterProcessLock(object):
     acquire the lock (and repeat).
     """
 
-    def __init__(self, path, sleep_func=time.sleep, logger=None):
+    def __init__(self, path, mechanism: Mechanism, sleep_func=time.sleep, logger=None):
         self.lockfile = None
         self.path = _utils.canonicalize_path(path)
+        self.mechanism = mechanism
         self.acquired = False
         self.sleep_func = sleep_func
         self.logger = _utils.pick_first_not_none(logger, LOG)
 
     def _try_acquire(self, blocking, watch):
         try:
-            self.trylock()
-        except IOError as e:
-            if e.errno in (errno.EACCES, errno.EAGAIN):
-                if not blocking or watch.expired():
-                    return False
-                else:
-                    raise _utils.RetryAgain()
-            else:
-                raise threading.ThreadError("Unable to acquire lock on"
-                                            " `%(path)s` due to"
-                                            " %(exception)s" %
-                                            {
-                                                'path': self.path,
-                                                'exception': e,
-                                            })
-        else:
+            gotten = self.mechanism.lock(self.lockfile, True)
+        except Exception as e:
+            raise threading.ThreadError(
+                "Unable to acquire lock on {} due to {}!".format(self.path, e))
+
+        if gotten:
             return True
+
+        if not blocking or watch.expired():
+            return False
+
+        raise _utils.RetryAgain()
 
     def _do_open(self):
         basedir = os.path.dirname(self.path)
@@ -169,7 +296,7 @@ class _InterProcessLock(object):
             raise threading.ThreadError("Unable to release an unacquired"
                                         " lock")
         try:
-            self.unlock()
+            self.mechanism.unlock(self.lockfile)
         except IOError:
             self.logger.exception("Could not unlock the acquired lock opened"
                                   " on `%s`", self.path)
@@ -193,21 +320,19 @@ class _InterProcessLock(object):
         return os.path.exists(self.path)
 
     def trylock(self):
-        self._trylock(self.lockfile)
+        warnings.warn('.trylock will be removed from the API in version 1.0. '
+                      'Use .acquire and .release instead.', DeprecationWarning)
+        gotten = self.mechanism.lock(self.lockfile, True)
+        if not gotten:
+            raise IOError
 
     def unlock(self):
-        self._unlock(self.lockfile)
-
-    @staticmethod
-    def _trylock(lockfile):
-        raise NotImplementedError()
-
-    @staticmethod
-    def _unlock(lockfile):
-        raise NotImplementedError()
+        warnings.warn('.unlock will be removed from the API in version 1.0. '
+                      'Use .acquire and .release instead.', DeprecationWarning)
+        self.mechanism.unlock(self.lockfile)
 
 
-class _InterProcessReaderWriterLock(object):
+class BaseInterProcessReaderWriterLock(object):
     """An interprocess readers writer lock."""
 
     MAX_DELAY = 0.1
@@ -224,15 +349,16 @@ class _InterProcessReaderWriterLock(object):
     acquire the lock (and repeat).
     """
 
-    def __init__(self, path, sleep_func=time.sleep, logger=None):
+    def __init__(self, path, mechanism: Mechanism, sleep_func=time.sleep, logger=None):
         self.lockfile = None
         self.path = _utils.canonicalize_path(path)
+        self.mechanism = mechanism
         self.sleep_func = sleep_func
         self.logger = _utils.pick_first_not_none(logger, LOG)
 
     def _try_acquire(self, blocking, watch, exclusive):
         try:
-            gotten = self._trylock(self.lockfile, exclusive)
+            gotten = self.mechanism.lock(self.lockfile, exclusive)
         except Exception as e:
             raise threading.ThreadError(
                 "Unable to acquire lock on {} due to {}!".format(self.path, e))
@@ -253,7 +379,7 @@ class _InterProcessReaderWriterLock(object):
                 self.logger.log(_utils.BLATHER,
                                 'Created lock base path `%s`', basedir)
         if self.lockfile is None:
-            self.lockfile = self._get_handle(self.path)
+            self.lockfile = open(self.path, 'a+')
 
     def acquire_read_lock(self, blocking=True,
                           delay=DELAY_INCREMENT, max_delay=MAX_DELAY,
@@ -328,13 +454,13 @@ class _InterProcessReaderWriterLock(object):
 
     def _do_close(self):
         if self.lockfile is not None:
-            self._close_handle(self.lockfile)
+            self.lockfile.close()
             self.lockfile = None
 
     def release_write_lock(self):
         """Release the writer's lock."""
         try:
-            self._unlock(self.lockfile)
+            self.mechanism.unlock(self.lockfile)
         except IOError:
             self.logger.exception("Could not unlock the acquired lock opened"
                                   " on `%s`", self.path)
@@ -352,7 +478,7 @@ class _InterProcessReaderWriterLock(object):
     def release_read_lock(self):
         """Release the reader's lock."""
         try:
-            self._unlock(self.lockfile)
+            self.mechanism.unlock(self.lockfile)
         except IOError:
             self.logger.exception("Could not unlock the acquired lock opened"
                                   " on `%s`", self.path)
@@ -393,136 +519,50 @@ class _InterProcessReaderWriterLock(object):
         finally:
             self.release_read_lock()
 
-    @staticmethod
-    def _trylock(lockfile, exclusive):
-        raise NotImplementedError()
 
-    @staticmethod
-    def _unlock(lockfile):
-        raise NotImplementedError()
-
-    @staticmethod
-    def _get_handle(path):
-        raise NotImplementedError()
-
-    @staticmethod
-    def _close_handle(lockfile):
-        raise NotImplementedError()
+# ---
+# Public API
 
 
-class _WindowsLock(_InterProcessLock):
-    """Interprocess lock implementation that works on windows systems."""
-
-    @staticmethod
-    def _trylock(lockfile):
-        fileno = lockfile.fileno()
-        msvcrt.locking(fileno, msvcrt.LK_NBLCK, 1)
-
-    @staticmethod
-    def _unlock(lockfile):
-        fileno = lockfile.fileno()
-        msvcrt.locking(fileno, msvcrt.LK_UNLCK, 1)
+class InterProcessLock(BaseInterProcessLock):
+    def __init__(self, path, sleep_func=time.sleep, logger=None):
+        mechanism = MSVCRTMechanism() if os.name == 'nt' else FcntlMechanism()
+        super().__init__(path, mechanism=mechanism, sleep_func=sleep_func, logger=logger)
 
 
-class _FcntlLock(_InterProcessLock):
-    """Interprocess lock implementation that works on posix systems."""
+class InterProcessReaderWriterLock(BaseInterProcessReaderWriterLock):
 
-    @staticmethod
-    def _trylock(lockfile):
-        fcntl.lockf(lockfile, fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-    @staticmethod
-    def _unlock(lockfile):
-        fcntl.lockf(lockfile, fcntl.LOCK_UN)
+    def __init__(self, path, sleep_func=time.sleep, logger=None):
+        mechanism = LockFileExMechanism() if os.name == 'nt' else FcntlMechanism()
+        super().__init__(path, mechanism=mechanism, sleep_func=sleep_func, logger=logger)
 
 
-class _WindowsInterProcessReaderWriterLock(_InterProcessReaderWriterLock):
-    """Interprocess readers writer lock implementation that works on windows
-    systems."""
-
-    @staticmethod
-    def _trylock(lockfile, exclusive):
-
-        if exclusive:
-            flags = win32con.LOCKFILE_FAIL_IMMEDIATELY | win32con.LOCKFILE_EXCLUSIVE_LOCK
-        else:
-            flags = win32con.LOCKFILE_FAIL_IMMEDIATELY
-
-        handle = msvcrt.get_osfhandle(lockfile.fileno())
-        ok = win32file.LockFileEx(handle, flags, 0, 1, 0, win32file.pointer(pywintypes.OVERLAPPED()))
-        if ok:
-            return True
-        else:
-            last_error = win32file.GetLastError()
-            if last_error == win32file.ERROR_LOCK_VIOLATION:
-                return False
-            else:
-                raise OSError(last_error)
-
-    @staticmethod
-    def _unlock(lockfile):
-        handle = msvcrt.get_osfhandle(lockfile.fileno())
-        ok = win32file.UnlockFileEx(handle, 0, 1, 0, win32file.pointer(pywintypes.OVERLAPPED()))
-        if not ok:
-            raise OSError(win32file.GetLastError())
-
-    @staticmethod
-    def _get_handle(path):
-        return open(path, 'a+')
-
-    @staticmethod
-    def _close_handle(lockfile):
-        lockfile.close()
+class FcntlLock(BaseInterProcessLock, BaseInterProcessReaderWriterLock):
+    def __init__(self, path, sleep_func=time.sleep, logger=None):
+        super().__init__(path, mechanism=FcntlMechanism(), sleep_func=sleep_func, logger=logger)
 
 
-class _FcntlInterProcessReaderWriterLock(_InterProcessReaderWriterLock):
-    """Interprocess readers writer lock implementation that works on posix
-    systems."""
-
-    @staticmethod
-    def _trylock(lockfile, exclusive):
-
-        if exclusive:
-            flags = fcntl.LOCK_EX | fcntl.LOCK_NB
-        else:
-            flags = fcntl.LOCK_SH | fcntl.LOCK_NB
-
-        try:
-            fcntl.lockf(lockfile, flags)
-            return True
-        except (IOError, OSError) as e:
-            if e.errno in (errno.EACCES, errno.EAGAIN):
-                return False
-            else:
-                raise e
-
-    @staticmethod
-    def _unlock(lockfile):
-        fcntl.lockf(lockfile, fcntl.LOCK_UN)
-
-    @staticmethod
-    def _get_handle(path):
-        return open(path, 'a+')
-
-    @staticmethod
-    def _close_handle(lockfile):
-        lockfile.close()
+class LockFileExLock(BaseInterProcessLock, BaseInterProcessReaderWriterLock):
+    def __init__(self, path, sleep_func=time.sleep, logger=None):
+        super().__init__(path, mechanism=LockFileExMechanism(), sleep_func=sleep_func, logger=logger)
 
 
-if os.name == 'nt':
-    import msvcrt
-    import fasteners.pywin32.pywintypes as pywintypes
-    import fasteners.pywin32.win32con as win32con
-    import fasteners.pywin32.win32file as win32file
+class MSVCRTLock(BaseInterProcessLock):
+    def __init__(self, path, sleep_func=time.sleep, logger=None):
+        super().__init__(path, mechanism=MSVCRTMechanism(), sleep_func=sleep_func, logger=logger)
 
-    InterProcessLock = _WindowsLock
-    InterProcessReaderWriterLock = _WindowsInterProcessReaderWriterLock
 
-else:
-    import fcntl
+# class FlockLock:
+#     def __init__(self, path, sleep_func=time.sleep, logger=None):
+#         super().__init__(path, mechanism=FlockMechanism(), sleep_func=sleep_func, logger=logger)
 
-    InterProcessLock = _FcntlLock
-    InterProcessReaderWriterLock = _FcntlInterProcessReaderWriterLock
+
+# class OpenLock:
+#     def __init__(self, path, sleep_func=time.sleep, logger=None):
+#         super().__init__(path, mechanism=OpenMechanism(), sleep_func=sleep_func, logger=logger)
+
+
+# ---
 
 
 def interprocess_write_locked(path):

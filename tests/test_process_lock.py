@@ -28,6 +28,8 @@ import time
 import pytest
 
 from fasteners import process_lock as pl
+from fasteners.process_lock import BaseInterProcessLock
+from fasteners.process_lock import Mechanism
 
 WIN32 = os.name == 'nt'
 
@@ -136,7 +138,9 @@ def test_nested_synchronized_external_works(lock_dir):
 
 
 def _lock_files(lock_path, handles_dir, num_handles=50):
-    with pl.InterProcessLock(lock_path):
+    lock = pl.InterProcessLock(lock_path)
+    mechanism = lock.mechanism
+    with lock:
 
         # Open some files we can use for locking
         handles = []
@@ -150,13 +154,12 @@ def _lock_files(lock_path, handles_dir, num_handles=50):
         # we get an IOError and bail out with bad exit code
         count = 0
         for handle in handles:
-            try:
-                pl.InterProcessLock._trylock(handle)
-                count += 1
-                pl.InterProcessLock._unlock(handle)
-            except IOError:
+            if not mechanism.lock(handle, True):
+                handle.close()
                 sys.exit(2)
-            finally:
+            else:
+                count += 1
+                mechanism.unlock(handle)
                 handle.close()
 
         # Check if we were able to open all files
@@ -249,22 +252,26 @@ def test_non_destructive(lock_dir):
             assert f.read() == 'test'
 
 
-class BrokenLock(pl.InterProcessLock):
-    def __init__(self, name, errno_code):
-        super(BrokenLock, self).__init__(name)
-        self.errno_code = errno_code
+class BrokenMechanism(Mechanism):
 
-    def unlock(self):
+    def lock(self, handle, exclusive):
+        err = IOError()
+        err.errno = errno.EBUSY
+        raise err
+
+    @staticmethod
+    def unlock(handle):
         pass
 
-    def trylock(self):
-        err = IOError()
-        err.errno = self.errno_code
-        raise err
+
+class BrokenLock(BaseInterProcessLock):
+
+    def __init__(self, path, sleep_func=time.sleep, logger=None):
+        super().__init__(path, mechanism=BrokenMechanism(), sleep_func=sleep_func, logger=logger)
 
 
 def test_bad_acquire(lock_dir):
     lock_file = os.path.join(lock_dir, 'lock')
-    lock = BrokenLock(lock_file, errno.EBUSY)
+    lock = BrokenLock(lock_file)
     with pytest.raises(threading.ThreadError):
         lock.acquire()
