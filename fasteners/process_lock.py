@@ -25,23 +25,12 @@ import time
 import warnings
 
 from fasteners import _utils
+from fasteners.file_lock_mechanism import FcntlMechanism
+from fasteners.file_lock_mechanism import LockFileExMechanism
+from fasteners.file_lock_mechanism import FileLockingMechanism
+from fasteners.file_lock_mechanism import MsvcrtMechanism
 
 LOG = logging.getLogger(__name__)
-
-try:
-    from fasteners import pywin32
-except Exception:  # noqa
-    pywin32 = None
-
-try:
-    import msvcrt
-except ImportError:
-    msvcrt = None
-
-try:
-    import fcntl
-except ImportError:
-    fcntl = None
 
 
 def _ensure_tree(path):
@@ -65,145 +54,115 @@ def _ensure_tree(path):
         return True
 
 
-# Locking mechanisms
-
-class Mechanism(abc.ABC):
-
-    @staticmethod
-    @abc.abstractmethod
-    def lock(handle, exclusive: bool):
-        ...
-
-    @staticmethod
-    @abc.abstractmethod
-    def unlock(handle):
-        ...
-
-
-class FcntlMechanism(Mechanism):
-
-    def __init__(self):
-        if fcntl is None:
-            raise OSError('This operating system does not support fcntl locking mechanism!')
-
-    @staticmethod
-    def lock(handle, exclusive):
-
-        if exclusive:
-            flags = fcntl.LOCK_EX | fcntl.LOCK_NB
-        else:
-            flags = fcntl.LOCK_SH | fcntl.LOCK_NB
-
-        try:
-            fcntl.lockf(handle, flags)
-            return True
-        except (IOError, OSError) as e:
-            if e.errno in (errno.EACCES, errno.EAGAIN):
-                return False
-            else:
-                raise e
-
-    @staticmethod
-    def unlock(handle):
-        fcntl.lockf(handle, fcntl.LOCK_UN)
-
-
-# TODO _mechanism
-# TODO lockfile
-
-class LockFileExMechanism(Mechanism):
-
-    def __init__(self):
-
-        if pywin32 is None:
-            raise OSError('This operating system does not support pywin32 and hence LockFileEx locking mechanism!')
-
-        if msvcrt is None:
-            raise OSError('This operating system does not support msvcrt and hence LockFileEx locking mechanism!')
-
-    @staticmethod
-    def lock(handle, exclusive):
-
-        if exclusive:
-            flags = pywin32.win32con.LOCKFILE_FAIL_IMMEDIATELY | pywin32.win32con.LOCKFILE_EXCLUSIVE_LOCK
-        else:
-            flags = pywin32.win32con.LOCKFILE_FAIL_IMMEDIATELY
-
-        handle = msvcrt.get_osfhandle(handle.fileno())
-        pointer = pywin32.win32file.pointer(pywin32.pywintypes.OVERLAPPED())
-        ok = pywin32.win32file.LockFileEx(handle, flags, 0, 1, 0, pointer)
-        if ok:
-            return True
-        else:
-            last_error = pywin32.win32file.GetLastError()
-            if last_error == pywin32.win32file.ERROR_LOCK_VIOLATION:
-                return False
-            else:
-                raise OSError(last_error)
-
-    @staticmethod
-    def unlock(handle):
-        handle = msvcrt.get_osfhandle(handle.fileno())
-        pointer = pywin32.win32file.pointer(pywin32.pywintypes.OVERLAPPED())
-        ok = pywin32.win32file.UnlockFileEx(handle, 0, 1, 0, pointer)
-        if not ok:
-            raise OSError(pywin32.win32file.GetLastError())
-
-
-class MSVCRTMechanism(Mechanism):
-
-    def __init__(self):
-        if pywin32 is None:
-            raise OSError('This operating system does not support msvcrt locking mechanism!')
-
-    @staticmethod
-    def lock(handle, exclusive):
-        if not exclusive:
-            raise ValueError('msvcrt does not support shared locks!')
-
-        fileno = handle.fileno()
-        msvcrt.locking(fileno, msvcrt.LK_NBLCK, 1)
-
-    @staticmethod
-    def unlock(handle):
-        fileno = handle.fileno()
-        msvcrt.locking(fileno, msvcrt.LK_UNLCK, 1)
-
-
-# class FlockMechanism(Mechanism):
-#     pass
-
-
-# class OpenMechanism(Mechanism):
-#     pass
-
-
-# -- Locks
-
 class BaseInterProcessLock(object):
-    """An interprocess lock."""
-
     MAX_DELAY = 0.1
     """
-    Default maximum delay we will wait to try to acquire the lock (when
+    Default maximum delay we will wait between attempts to acquire the lock (when
     it's busy/being held by another process).
     """
 
     DELAY_INCREMENT = 0.01
     """
-    Default increment we will use (up to max delay) after each attempt before
-    next attempt to acquire the lock. For example if 3 attempts have been made
-    the calling thread will sleep (0.01 * 3) before the next attempt to
-    acquire the lock (and repeat).
+    Default increment of the delay between attempts to acquire the lock. The delay
+    will start at DELAY_INCREMENTAL and increase by DELAY_INCREMENTAL every attempt 
+    until MAX_DELAY is reached.
     """
 
-    def __init__(self, path, mechanism: Mechanism, sleep_func=time.sleep, logger=None):
+    @property
+    @abc.abstractmethod
+    def mechanism(self) -> FileLockingMechanism:
+        ...
+
+    def __init__(self, path, sleep_func=time.sleep, logger=None):
+        self.mechanism.check_availability()
         self.lockfile = None
         self.path = _utils.canonicalize_path(path)
-        self.mechanism = mechanism
         self.acquired = False
         self.sleep_func = sleep_func
         self.logger = _utils.pick_first_not_none(logger, LOG)
+
+    def acquire(self,
+                blocking: bool = True,
+                delay: float = DELAY_INCREMENT,
+                max_delay: float = MAX_DELAY,
+                timeout: float = None):
+        """Attempt to acquire the lock.
+
+        Parameters
+        ----------
+        blocking:
+            Whether to wait forever to try to acquire the lock
+        delay:
+            When blocking, this is the increment of the delay time
+            between attempts in seconds (default = 0.01)
+        max_delay:
+            When blocking, this is the maximum delay time between
+            attempts in seconds (default = 0.1)
+        timeout
+            When blocking, this is the maximum time for which acquiring
+            will be attempted
+
+        Returns
+        -------
+        bool
+            Whether the lock was acquired or not
+        """
+        if delay < 0:
+            raise ValueError("Delay must be greater than or equal to zero")
+        if timeout is not None and timeout < 0:
+            raise ValueError("Timeout must be greater than or equal to zero")
+        if delay >= max_delay:
+            max_delay = delay
+        self._do_open()
+        watch = _utils.StopWatch(duration=timeout)
+        r = _utils.Retry(delay, max_delay,
+                         sleep_func=self.sleep_func, watch=watch)
+        with watch:
+            gotten = r(self._try_acquire, blocking, watch)
+        if not gotten:
+            self.acquired = False
+            return False
+        else:
+            self.acquired = True
+            self.logger.log(_utils.BLATHER,
+                            "Acquired file lock `%s` after waiting %0.3fs [%s"
+                            " attempts were required]", self.path,
+                            watch.elapsed(), r.attempts)
+            return True
+
+    def release(self):
+        """Release the previously acquired lock."""
+        if not self.acquired:
+            raise threading.ThreadError("Unable to release an unacquired"
+                                        " lock")
+        try:
+            self.mechanism.unlock(self.lockfile)
+        except IOError:
+            self.logger.exception("Could not unlock the acquired lock opened"
+                                  " on `%s`", self.path)
+        else:
+            self.acquired = False
+            try:
+                self._do_close()
+            except IOError:
+                self.logger.exception("Could not close the file handle"
+                                      " opened on `%s`", self.path)
+            else:
+                self.logger.log(_utils.BLATHER,
+                                "Unlocked and closed file lock open on"
+                                " `%s`", self.path)
+
+    def __enter__(self):
+        gotten = self.acquire()
+        if not gotten:
+            # This shouldn't happen, but just incase...
+            raise threading.ThreadError("Unable to acquire a file lock"
+                                        " on `%s` (when used as a"
+                                        " context manager)" % self.path)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release()
 
     def _try_acquire(self, blocking, watch):
         try:
@@ -233,89 +192,13 @@ class BaseInterProcessLock(object):
         if self.lockfile is None or self.lockfile.closed:
             self.lockfile = open(self.path, 'a')
 
-    def acquire(self, blocking=True,
-                delay=DELAY_INCREMENT, max_delay=MAX_DELAY,
-                timeout=None):
-        """Attempt to acquire the given lock.
-
-        :param blocking: whether to wait forever to try to acquire the lock
-        :type blocking: bool
-        :param delay: when blocking this is the delay time in seconds that
-                      will be added after each failed acquisition
-        :type delay: int/float
-        :param max_delay: the maximum delay to have (this limits the
-                          accumulated delay(s) added after each failed
-                          acquisition)
-        :type max_delay: int/float
-        :param timeout: an optional timeout (limits how long blocking
-                        will occur for)
-        :type timeout: int/float
-        :returns: whether or not the acquisition succeeded
-        :rtype: bool
-        """
-        if delay < 0:
-            raise ValueError("Delay must be greater than or equal to zero")
-        if timeout is not None and timeout < 0:
-            raise ValueError("Timeout must be greater than or equal to zero")
-        if delay >= max_delay:
-            max_delay = delay
-        self._do_open()
-        watch = _utils.StopWatch(duration=timeout)
-        r = _utils.Retry(delay, max_delay,
-                         sleep_func=self.sleep_func, watch=watch)
-        with watch:
-            gotten = r(self._try_acquire, blocking, watch)
-        if not gotten:
-            self.acquired = False
-            return False
-        else:
-            self.acquired = True
-            self.logger.log(_utils.BLATHER,
-                            "Acquired file lock `%s` after waiting %0.3fs [%s"
-                            " attempts were required]", self.path,
-                            watch.elapsed(), r.attempts)
-            return True
-
     def _do_close(self):
         if self.lockfile is not None:
             self.lockfile.close()
             self.lockfile = None
 
-    def __enter__(self):
-        gotten = self.acquire()
-        if not gotten:
-            # This shouldn't happen, but just incase...
-            raise threading.ThreadError("Unable to acquire a file lock"
-                                        " on `%s` (when used as a"
-                                        " context manager)" % self.path)
-        return self
-
-    def release(self):
-        """Release the previously acquired lock."""
-        if not self.acquired:
-            raise threading.ThreadError("Unable to release an unacquired"
-                                        " lock")
-        try:
-            self.mechanism.unlock(self.lockfile)
-        except IOError:
-            self.logger.exception("Could not unlock the acquired lock opened"
-                                  " on `%s`", self.path)
-        else:
-            self.acquired = False
-            try:
-                self._do_close()
-            except IOError:
-                self.logger.exception("Could not close the file handle"
-                                      " opened on `%s`", self.path)
-            else:
-                self.logger.log(_utils.BLATHER,
-                                "Unlocked and closed file lock open on"
-                                " `%s`", self.path)
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.release()
-
     def exists(self):
+        warnings.warn('.exists will be removed from the API in version 1.0. ', DeprecationWarning)
         """Checks if the path that this lock exists at actually exists."""
         return os.path.exists(self.path)
 
@@ -333,129 +216,84 @@ class BaseInterProcessLock(object):
 
 
 class BaseInterProcessReaderWriterLock(object):
-    """An interprocess readers writer lock."""
-
     MAX_DELAY = 0.1
     """
-    Default maximum delay we will wait to try to acquire the lock (when
+    Default maximum delay we will wait between attempts to acquire the lock (when
     it's busy/being held by another process).
     """
 
     DELAY_INCREMENT = 0.01
     """
-    Default increment we will use (up to max delay) after each attempt before
-    next attempt to acquire the lock. For example if 3 attempts have been made
-    the calling thread will sleep (0.01 * 3) before the next attempt to
-    acquire the lock (and repeat).
+    Default increment of the delay between attempts to acquire the lock. The delay
+    will start at DELAY_INCREMENTAL and increase by DELAY_INCREMENTAL every attempt 
+    until MAX_DELAY is reached.
     """
 
-    def __init__(self, path, mechanism: Mechanism, sleep_func=time.sleep, logger=None):
+    @property
+    @abc.abstractmethod
+    def mechanism(self) -> FileLockingMechanism:
+        ...
+
+    def __init__(self, path, sleep_func=time.sleep, logger=None):
+        self.mechanism.check_availability()
         self.lockfile = None
         self.path = _utils.canonicalize_path(path)
-        self.mechanism = mechanism
         self.sleep_func = sleep_func
         self.logger = _utils.pick_first_not_none(logger, LOG)
 
-    def _try_acquire(self, blocking, watch, exclusive):
-        try:
-            gotten = self.mechanism.lock(self.lockfile, exclusive)
-        except Exception as e:
-            raise threading.ThreadError(
-                "Unable to acquire lock on {} due to {}!".format(self.path, e))
-
-        if gotten:
-            return True
-
-        if not blocking or watch.expired():
-            return False
-
-        raise _utils.RetryAgain()
-
-    def _do_open(self):
-        basedir = os.path.dirname(self.path)
-        if basedir:
-            made_basedir = _ensure_tree(basedir)
-            if made_basedir:
-                self.logger.log(_utils.BLATHER,
-                                'Created lock base path `%s`', basedir)
-        if self.lockfile is None:
-            self.lockfile = open(self.path, 'a+')
-
-    def acquire_read_lock(self, blocking=True,
-                          delay=DELAY_INCREMENT, max_delay=MAX_DELAY,
-                          timeout=None):
-
+    def acquire_read_lock(self,
+                          blocking: bool = True,
+                          delay: float = DELAY_INCREMENT,
+                          max_delay: float = MAX_DELAY,
+                          timeout: float = None):
         """Attempt to acquire a reader's lock.
 
-        :param blocking: whether to wait forever to try to acquire the lock
-        :type blocking: bool
-        :param delay: when blocking this is the delay time in seconds that
-                      will be added after each failed acquisition
-        :type delay: int/float
-        :param max_delay: the maximum delay to have (this limits the
-                          accumulated delay(s) added after each failed
-                          acquisition)
-        :type max_delay: int/float
-        :param timeout: an optional timeout (limits how long blocking
-                        will occur for)
-        :type timeout: int/float
-        :returns: whether or not the acquisition succeeded
-        :rtype: bool
+        Parameters
+        ----------
+        blocking:
+            Whether to wait forever to try to acquire the lock
+        delay:
+            When blocking, this is the increment of the delay time
+            between attempts in seconds (default = 0.01)
+        max_delay:
+            When blocking, this is the maximum delay time between
+            attempts in seconds (default = 0.1)
+        timeout
+            When blocking, this is the maximum time for which acquiring
+            will be attempted
+
+        Returns
+        -------
+        bool
+            Whether the lock was acquired or not
         """
         return self._acquire(blocking, delay, max_delay, timeout, exclusive=False)
 
     def acquire_write_lock(self, blocking=True,
                            delay=DELAY_INCREMENT, max_delay=MAX_DELAY,
                            timeout=None):
-
         """Attempt to acquire a writer's lock.
 
-        :param blocking: whether to wait forever to try to acquire the lock
-        :type blocking: bool
-        :param delay: when blocking this is the delay time in seconds that
-                      will be added after each failed acquisition
-        :type delay: int/float
-        :param max_delay: the maximum delay to have (this limits the
-                          accumulated delay(s) added after each failed
-                          acquisition)
-        :type max_delay: int/float
-        :param timeout: an optional timeout (limits how long blocking
-                        will occur for)
-        :type timeout: int/float
-        :returns: whether or not the acquisition succeeded
-        :rtype: bool
+        Parameters
+        ----------
+        blocking:
+            Whether to wait forever to try to acquire the lock
+        delay:
+            When blocking, this is the increment of the delay time
+            between attempts in seconds (default = 0.01)
+        max_delay:
+            When blocking, this is the maximum delay time between
+            attempts in seconds (default = 0.1)
+        timeout
+            When blocking, this is the maximum time for which acquiring
+            will be attempted
+
+        Returns
+        -------
+        bool
+            Whether the lock was acquired or not
         """
         return self._acquire(blocking, delay, max_delay, timeout, exclusive=True)
-
-    def _acquire(self, blocking=True,
-                 delay=DELAY_INCREMENT, max_delay=MAX_DELAY,
-                 timeout=None, exclusive=True):
-
-        if delay < 0:
-            raise ValueError("Delay must be greater than or equal to zero")
-        if timeout is not None and timeout < 0:
-            raise ValueError("Timeout must be greater than or equal to zero")
-        if delay >= max_delay:
-            max_delay = delay
-        self._do_open()
-        watch = _utils.StopWatch(duration=timeout)
-        r = _utils.Retry(delay, max_delay,
-                         sleep_func=self.sleep_func, watch=watch)
-        with watch:
-            gotten = r(self._try_acquire, blocking, watch, exclusive)
-        if not gotten:
-            return False
-        else:
-            self.logger.log(_utils.BLATHER,
-                            "Acquired file lock `%s` after waiting %0.3fs [%s"
-                            " attempts were required]", self.path,
-                            watch.elapsed(), r.attempts)
-            return True
-
-    def _do_close(self):
-        if self.lockfile is not None:
-            self.lockfile.close()
-            self.lockfile = None
 
     def release_write_lock(self):
         """Release the writer's lock."""
@@ -519,50 +357,179 @@ class BaseInterProcessReaderWriterLock(object):
         finally:
             self.release_read_lock()
 
+    def _acquire(self, blocking=True,
+                 delay=DELAY_INCREMENT, max_delay=MAX_DELAY,
+                 timeout=None, exclusive=True):
 
-# ---
-# Public API
+        if delay < 0:
+            raise ValueError("Delay must be greater than or equal to zero")
+        if timeout is not None and timeout < 0:
+            raise ValueError("Timeout must be greater than or equal to zero")
+        if delay >= max_delay:
+            max_delay = delay
+        self._do_open()
+        watch = _utils.StopWatch(duration=timeout)
+        r = _utils.Retry(delay, max_delay,
+                         sleep_func=self.sleep_func, watch=watch)
+        with watch:
+            gotten = r(self._try_acquire, blocking, watch, exclusive)
+        if not gotten:
+            return False
+        else:
+            self.logger.log(_utils.BLATHER,
+                            "Acquired file lock `%s` after waiting %0.3fs [%s"
+                            " attempts were required]", self.path,
+                            watch.elapsed(), r.attempts)
+            return True
+
+    def _try_acquire(self, blocking, watch, exclusive):
+        try:
+            gotten = self.mechanism.lock(self.lockfile, exclusive)
+        except Exception as e:
+            raise threading.ThreadError(
+                "Unable to acquire lock on {} due to {}!".format(self.path, e))
+
+        if gotten:
+            return True
+
+        if not blocking or watch.expired():
+            return False
+
+        raise _utils.RetryAgain()
+
+    def _do_open(self):
+        basedir = os.path.dirname(self.path)
+        if basedir:
+            made_basedir = _ensure_tree(basedir)
+            if made_basedir:
+                self.logger.log(_utils.BLATHER,
+                                'Created lock base path `%s`', basedir)
+        if self.lockfile is None:
+            self.lockfile = open(self.path, 'a+')
+
+    def _do_close(self):
+        if self.lockfile is not None:
+            self.lockfile.close()
+            self.lockfile = None
 
 
 class InterProcessLock(BaseInterProcessLock):
+    """
+    A cross platform interprocess exclusive lock.
+
+    Depending on the platform, either fcntl or msvcrt locking mechanism
+    will be used.
+
+    The lock can be acquired and released by using the corresponding
+    methods, or by using it as a context manager.
+    """
+    mechanism = MsvcrtMechanism() if os.name == 'nt' else FcntlMechanism()
+
     def __init__(self, path, sleep_func=time.sleep, logger=None):
-        mechanism = MSVCRTMechanism() if os.name == 'nt' else FcntlMechanism()
-        super().__init__(path, mechanism=mechanism, sleep_func=sleep_func, logger=logger)
+        """
+        Parameters
+        ----------
+        path:
+            File to use for locking
+        sleep_func:
+            Function to use for sleeping (default=time.sleep)
+        logger:
+            Logger to use for logging (default=logging.getLogger(__name__))
+        """
+        super().__init__(path, sleep_func, logger)
 
 
 class InterProcessReaderWriterLock(BaseInterProcessReaderWriterLock):
+    mechanism = LockFileExMechanism() if os.name == 'nt' else FcntlMechanism()
 
     def __init__(self, path, sleep_func=time.sleep, logger=None):
-        mechanism = LockFileExMechanism() if os.name == 'nt' else FcntlMechanism()
-        super().__init__(path, mechanism=mechanism, sleep_func=sleep_func, logger=logger)
+        """
+        A cross platform interprocess readers writer lock.
+
+        Depending on the platform, either fcntl or LockFileEx locking mechanism
+        will be used.
+
+        Parameters
+        ----------
+        path:
+            File to use for locking
+        sleep_func:
+            Function to use for sleeping (default=time.sleep)
+        logger:
+            Logger to use for logging (default=logging.getLogger(__name__))
+        """
+        super().__init__(path, sleep_func, logger)
 
 
 class FcntlLock(BaseInterProcessLock, BaseInterProcessReaderWriterLock):
+    mechanism = FcntlMechanism()
+
     def __init__(self, path, sleep_func=time.sleep, logger=None):
-        super().__init__(path, mechanism=FcntlMechanism(), sleep_func=sleep_func, logger=logger)
+        """
+        Fcntl mechanism based lock
+
+        Can be used as a simple exclusive access lock, or as a readers
+        writer lock.
+
+        Parameters
+        ----------
+        path:
+            File to use for locking
+        sleep_func:
+            Function to use for sleeping (default=time.sleep)
+        logger:
+            Logger to use for logging (default=logging.getLogger(__name__))
+        """
+        super().__init__(path, sleep_func, logger)
 
 
 class LockFileExLock(BaseInterProcessLock, BaseInterProcessReaderWriterLock):
+    mechanism = LockFileExMechanism()
+
     def __init__(self, path, sleep_func=time.sleep, logger=None):
-        super().__init__(path, mechanism=LockFileExMechanism(), sleep_func=sleep_func, logger=logger)
+        """
+        LockFileEx mechanism based lock
+
+        Can be used as a simple exclusive access lock, or as a readers
+        writer lock.
+
+        Parameters
+        ----------
+        path:
+            File to use for locking
+        sleep_func:
+            Function to use for sleeping (default=time.sleep)
+        logger:
+            Logger to use for logging (default=logging.getLogger(__name__))
+        """
+        super().__init__(path, sleep_func, logger)
 
 
-class MSVCRTLock(BaseInterProcessLock):
+class MsvcrtLock(BaseInterProcessLock):
+    mechanism = MsvcrtMechanism()
+
     def __init__(self, path, sleep_func=time.sleep, logger=None):
-        super().__init__(path, mechanism=MSVCRTMechanism(), sleep_func=sleep_func, logger=logger)
+        """
+        Msvcrt mechanism based exclusive lock
+
+        Parameters
+        ----------
+        path:
+            File to use for locking
+        sleep_func:
+            Function to use for sleeping (default=time.sleep)
+        logger:
+            Logger to use for logging (default=logging.getLogger(__name__))
+        """
+        super().__init__(path, sleep_func, logger)
 
 
+# TODO
 # class FlockLock:
-#     def __init__(self, path, sleep_func=time.sleep, logger=None):
-#         super().__init__(path, mechanism=FlockMechanism(), sleep_func=sleep_func, logger=logger)
 
 
+# TODO
 # class OpenLock:
-#     def __init__(self, path, sleep_func=time.sleep, logger=None):
-#         super().__init__(path, mechanism=OpenMechanism(), sleep_func=sleep_func, logger=logger)
-
-
-# ---
 
 
 def interprocess_write_locked(path):

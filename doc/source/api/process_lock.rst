@@ -61,15 +61,23 @@ Classes
 
 .. autoclass:: fasteners.process_lock.InterProcessLock
    :members:
-
-.. autoclass:: fasteners.process_lock._InterProcessLock
-   :members:
+   :inherited-members:
 
 .. autoclass:: fasteners.process_lock.InterProcessReaderWriterLock
    :members:
+   :inherited-members:
 
-.. autoclass:: fasteners.process_lock._InterProcessReaderWriterLock
+.. autoclass:: fasteners.process_lock.FcntlLock
    :members:
+   :inherited-members:
+
+.. autoclass:: fasteners.process_lock.LockFileExLock
+   :members:
+   :inherited-members:
+
+.. autoclass:: fasteners.process_lock.MsvcrtLock
+   :members:
+   :inherited-members:
 
 
 ----------

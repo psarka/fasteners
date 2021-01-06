@@ -29,7 +29,7 @@ import pytest
 
 from fasteners import process_lock as pl
 from fasteners.process_lock import BaseInterProcessLock
-from fasteners.process_lock import Mechanism
+from fasteners.process_lock import FileLockingMechanism
 
 WIN32 = os.name == 'nt'
 
@@ -252,7 +252,7 @@ def test_non_destructive(lock_dir):
             assert f.read() == 'test'
 
 
-class BrokenMechanism(Mechanism):
+class BrokenMechanism(FileLockingMechanism):
 
     def lock(self, handle, exclusive):
         err = IOError()
