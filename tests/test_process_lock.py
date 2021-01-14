@@ -154,7 +154,7 @@ def _lock_files(lock_path, handles_dir, num_handles=50):
         # we get an IOError and bail out with bad exit code
         count = 0
         for handle in handles:
-            if not mechanism.lock(handle, True):
+            if not mechanism.lock(handle, True, blocking=False):
                 handle.close()
                 sys.exit(2)
             else:
@@ -254,6 +254,9 @@ def test_non_destructive(lock_dir):
 
 class BrokenMechanism(FileLockingMechanism):
 
+    def check_availability(self):
+        pass
+
     def lock(self, handle, exclusive):
         err = IOError()
         err.errno = errno.EBUSY
@@ -265,9 +268,10 @@ class BrokenMechanism(FileLockingMechanism):
 
 
 class BrokenLock(BaseInterProcessLock):
+    mechanism = BrokenMechanism()
 
     def __init__(self, path, sleep_func=time.sleep, logger=None):
-        super().__init__(path, mechanism=BrokenMechanism(), sleep_func=sleep_func, logger=logger)
+        super().__init__(path, sleep_func=sleep_func, logger=logger)
 
 
 def test_bad_acquire(lock_dir):

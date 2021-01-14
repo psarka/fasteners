@@ -19,8 +19,8 @@
 file_locking_mechanism module faithfully and thinly (but sanely!) wraps all
 the available file locking mechanisms. Currently it exposes all the possible
 file locking mechanisms enabled by python standard library, and in the future
-it will broaden to include features and mechanisms that are only available
-through C extensions.
+it will include features and mechanisms that are only available through C
+extensions.
 
 These mechanisms can be used on their own and will be a part of public
 fasteners API, or can be further wrapped on top to produce a syntactically
@@ -57,34 +57,38 @@ except ImportError:
     F_OFD_SETLK = None
     F_OFD_SETLKW = None
 
-RelativeTo = Literal['start', 'current', 'end']
-Start = Literal['start']
-
 
 class FileLockingMechanism(abc.ABC):
-    can_share: bool
-    can_block: bool
-    can_switch: bool
+    """File locking Mechanism"""
+
+    can_share = False
+    """Whether the mechanism supports shared locks"""
+
+    can_block = False
+    """Whether the mechanism supports blocking until lock is acquired"""
+
+    can_switch = False
+    """Whether the mechanism can atomically switch shared vs exclusive locks"""
+
+    available = False
+    """Whether the mechanism is available on the current platform"""
 
     @staticmethod
     @abc.abstractmethod
-    def lock(handle,
-             exclusive: bool,
-             blocking: bool) -> bool:
-        """Acquire a lock
+    def lock(handle):
+        """Acquire (if available immediately) an exclusive lock on the file
 
-        Acquiring lock can fail if the handle is already locked by another
+        Acquiring a lock can fail if the handle is already locked by another
         process, or because of some unexpected issue. The former (normal)
         failure is reported by the return value, the latter by an exception.
+
+        msvcrt mechanism does not support shared locks, and does not support
+        blocking until a lock is acquired.
 
         Parameters
         ----------
         handle:
             File handle
-        exclusive:
-            Whether to acquire an exclusive or shared lock
-        blocking:
-            Whether to block until a lock is acquired
 
         Returns
         -------
@@ -95,10 +99,7 @@ class FileLockingMechanism(abc.ABC):
     @staticmethod
     @abc.abstractmethod
     def unlock(handle):
-        """Release a lock
-
-        Releasing can fail if a lock is not held (nothing to release), or
-        because of some unexpected issue. In both cases, an exception is raised.
+        """Release the previously acquired lock
 
         Parameters
         ----------
@@ -106,34 +107,23 @@ class FileLockingMechanism(abc.ABC):
             File handle
         """
 
-    @abc.abstractmethod
-    def check_availability(self):
-        """Check if the mechanism is available on the platform that is trying
-        to use it.
 
-        Raises
-        ------
-        OSError
-            In case it is not available
-        """
+RelativeTo = Literal['start', 'current', 'end']
 
 
 class FcntlMechanism(FileLockingMechanism):
     """
     A file locking mechanism based on fcntl.
     """
+    available = fcntl is not None
     can_share = True
     can_block = True
     can_switch = True
 
-    def check_availability(self):
-        if fcntl is None:
-            raise OSError('This operating system does not support fcntl locking mechanism!')
-
     @staticmethod
     def lock(handle,
-             exclusive: bool,
-             blocking: bool,
+             exclusive: bool = True,
+             blocking: bool = False,
              offset: int = 0,
              length: int = 0,
              relative_to: RelativeTo = 'start') -> bool:
@@ -186,9 +176,15 @@ class FcntlMechanism(FileLockingMechanism):
         if not blocking:
             flags |= fcntl.LOCK_NB
 
-        whence = (0 if relative_to == 'start' else
-                  1 if relative_to == 'current' else
-                  2)
+        if relative_to == 'start':
+            whence = 0
+        elif relative_to == 'current':
+            whence = 1
+        elif relative_to == 'end':
+            whence = 2
+        else:
+            raise ValueError(f"relative_to should be 'start', 'current', or 'end', "
+                             f"received {relative_to}!")
 
         try:
             fcntl.lockf(handle, flags, length, offset, whence)
@@ -233,9 +229,16 @@ class FcntlMechanism(FileLockingMechanism):
             Can be either 'start' of the file, 'current' position or 'end' of
             the file. (default='start')
         """
-        whence = (0 if relative_to == 'start' else
-                  1 if relative_to == 'current' else
-                  2)
+        if relative_to == 'start':
+            whence = 0
+        elif relative_to == 'current':
+            whence = 1
+        elif relative_to == 'end':
+            whence = 2
+        else:
+            raise ValueError(f"relative_to should be 'start', 'current', or 'end', "
+                             f"received {relative_to}!")
+
         fcntl.lockf(handle, fcntl.LOCK_UN, length, offset, whence)
 
 
@@ -243,16 +246,17 @@ class LockFileExMechanism(FileLockingMechanism):
     """
     A file locking mechanism based on LockFileEx.
     """
+    available = pywin32 is not None and msvcrt is not None
     can_share = True
     can_block = True
     can_switch = False
 
-    def check_availability(self):
-        if pywin32 is None or msvcrt is None:
-            raise OSError('This operating system does not support LockFileEx locking mechanism!')
-
     @staticmethod
-    def lock(handle, exclusive, blocking, offset=0, length=1):
+    def lock(handle,
+             exclusive: bool = True,
+             blocking: bool = False,
+             offset: int = 0,
+             length: int = 1):
         """Acquire a lock on the byte range of the file
 
         The byte range is computed as (relative to file start)
@@ -323,7 +327,7 @@ class LockFileExMechanism(FileLockingMechanism):
                 raise OSError(last_error)
 
     @staticmethod
-    def unlock(handle, offset=0, length=1):
+    def unlock(handle, offset: int = 0, length: int = 1):
         """Release a lock on the byte range of the file
 
         The byte range is computed as (relative to file start)
@@ -380,19 +384,16 @@ class MsvcrtMechanism(FileLockingMechanism):
     """
     A file locking mechanism based on msvcrt.
     """
+    available = msvcrt is not None
     can_share = False
     can_block = False
     can_switch = False
 
-    def check_availability(self):
-        if msvcrt is None:
-            raise OSError('This operating system does not support msvcrt locking mechanism!')
-
     @staticmethod
-    def lock(handle, exclusive: Literal[True] = True, blocking: Literal[False] = False):
-        """Acquire a lock on the file
+    def lock(handle):
+        """Acquire (if available immediately) an exclusive lock on the file
 
-        Acquiring lock can fail if the handle is already locked by another
+        Acquiring a lock can fail if the handle is already locked by another
         process, or because of some unexpected issue. The former (normal)
         failure is reported by the return value, the latter by an exception.
 
@@ -403,45 +404,33 @@ class MsvcrtMechanism(FileLockingMechanism):
         ----------
         handle:
             File handle
-        exclusive:
-            Whether to acquire an exclusive or shared lock. Must be equal to
-            True as only exclusive lock is supported (default = True)
-        blocking:
-            Whether to block until a lock is acquired. Must be equal to False,
-            as blocking is not supported (default = False)
 
         Returns
         -------
         bool
             Whether a lock was acquired
         """
-        if not exclusive:
-            raise ValueError('msvcrt does not support shared locks!')
-
-        if blocking:
-            raise ValueError('msvcrt does not support blocking!')
-
-        fileno = handle.fileno()
-        msvcrt.locking(fileno, msvcrt.LK_NBLCK, 1)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
 
     @staticmethod
     def unlock(handle):
-        fileno = handle.fileno()
-        msvcrt.locking(fileno, msvcrt.LK_UNLCK, 1)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
 
-class FlockMechanism(FileLockingMechanism):
-    """A file locking mechanism based on a python interpretation of flock"""
+class PythonFlockMechanism(FileLockingMechanism):
+    """A file locking mechanism based on a python interpretation of flock.
+
+    It differs from the genuine flock in that it falls back to fcntl if flock
+    is not available on the system. Hence, PythonFlock mechanism cannot be
+    trusted to lock inter threads.
+    """
+    available = fcntl is not None
     can_share = True
     can_block = True
     can_switch = False
 
-    def check_availability(self):
-        if fcntl is None:
-            raise OSError('This operating system does not support flock locking mechanism!')
-
     @staticmethod
-    def lock(handle, exclusive, blocking):
+    def lock(handle, exclusive: bool = True, blocking: bool = False):
         """Acquire a lock on the file
 
         Acquiring a lock can fail if the handle is already locked by another
@@ -494,23 +483,24 @@ _unlock_type = struct.pack('hh' + start_len + 'hh', fcntl.F_UNLCK, 0, 0, 0, 0, 0
 
 
 class OpenMechanism(FileLockingMechanism):
-
-    def check_availability(self):
-        if fcntl is None or F_OFD_SETLK is None:
-            raise OSError('This operating system does not support open locking mechanism!')
+    available = fcntl is not None and F_OFD_SETLK is not None
+    can_share = True
+    can_block = True
+    can_switch = True
 
     @staticmethod
     def lock(handle,
-             exclusive: bool,
-             blocking: bool,
-             offset: Literal[0] = 0,
-             length: Literal[0] = 0,
-             relative_to: Start = 'start') -> bool:
+             exclusive: bool = True,
+             blocking: bool = False) -> bool:
         """Acquire a lock on an infinite byte range [0, ∞] of the file
 
         Acquiring a lock can fail if the handle is already locked by another
         process, or because of some unexpected issue. The former (normal)
         failure is reported by the return value, the latter by an exception.
+
+        Current implementation is based on python 3.9 fcntl features and does
+        not support different byte ranges, hopefully in the future it will
+        depend only on python 3.6 and will support byte ranges.
 
         Parameters
         ----------
@@ -520,16 +510,6 @@ class OpenMechanism(FileLockingMechanism):
             Whether to acquire an exclusive or shared lock
         blocking:
             Whether to block until a lock is acquired
-        offset:
-            Offset (in bytes) of the byte range to lock. Currently only value 0
-            is supported (default=0)
-        length:
-            Length (in bytes) of the byte range to lock, with 0 being a special
-            value meaning ∞. Currently only value 0 is supported (default=0)
-        relative_to:
-            File position relative to which the byte range offset is computed.
-            Can be either 'start' of the file, 'current' position or 'end' of
-            the file. Currently only 'start' is supported (default='start')
 
         Returns
         -------

@@ -25,10 +25,10 @@ import time
 import warnings
 
 from fasteners import _utils
-from fasteners.file_lock_mechanism import FcntlMechanism
-from fasteners.file_lock_mechanism import LockFileExMechanism
-from fasteners.file_lock_mechanism import FileLockingMechanism
-from fasteners.file_lock_mechanism import MsvcrtMechanism
+from fasteners.file_locking_mechanism import FcntlMechanism
+from fasteners.file_locking_mechanism import FileLockingMechanism
+from fasteners.file_locking_mechanism import LockFileExMechanism
+from fasteners.file_locking_mechanism import MsvcrtMechanism
 
 LOG = logging.getLogger(__name__)
 
@@ -74,7 +74,10 @@ class BaseInterProcessLock(object):
         ...
 
     def __init__(self, path, sleep_func=time.sleep, logger=None):
-        self.mechanism.check_availability()
+
+        if not self.mechanism.available:
+            raise OSError(f'This operating system does not support {self.mechanism.__name__}!')
+
         self.lockfile = None
         self.path = _utils.canonicalize_path(path)
         self.acquired = False
@@ -166,7 +169,7 @@ class BaseInterProcessLock(object):
 
     def _try_acquire(self, blocking, watch):
         try:
-            gotten = self.mechanism.lock(self.lockfile, True)
+            gotten = self.mechanism.lock(self.lockfile, True, blocking=blocking)
         except Exception as e:
             raise threading.ThreadError(
                 "Unable to acquire lock on {} due to {}!".format(self.path, e))
@@ -198,14 +201,14 @@ class BaseInterProcessLock(object):
             self.lockfile = None
 
     def exists(self):
-        warnings.warn('.exists will be removed from the API in version 1.0. ', DeprecationWarning)
         """Checks if the path that this lock exists at actually exists."""
+        warnings.warn('.exists will be removed from the API in version 1.0. ', DeprecationWarning)
         return os.path.exists(self.path)
 
     def trylock(self):
         warnings.warn('.trylock will be removed from the API in version 1.0. '
                       'Use .acquire and .release instead.', DeprecationWarning)
-        gotten = self.mechanism.lock(self.lockfile, True)
+        gotten = self.mechanism.lock(self.lockfile, True, blocking=False)
         if not gotten:
             raise IOError
 
@@ -235,7 +238,10 @@ class BaseInterProcessReaderWriterLock(object):
         ...
 
     def __init__(self, path, sleep_func=time.sleep, logger=None):
-        self.mechanism.check_availability()
+
+        if not self.mechanism.available:
+            raise OSError(f'This operating system does not support {self.mechanism.__name__}!')
+
         self.lockfile = None
         self.path = _utils.canonicalize_path(path)
         self.sleep_func = sleep_func
@@ -384,7 +390,7 @@ class BaseInterProcessReaderWriterLock(object):
 
     def _try_acquire(self, blocking, watch, exclusive):
         try:
-            gotten = self.mechanism.lock(self.lockfile, exclusive)
+            gotten = self.mechanism.lock(self.lockfile, exclusive, blocking=blocking)
         except Exception as e:
             raise threading.ThreadError(
                 "Unable to acquire lock on {} due to {}!".format(self.path, e))
