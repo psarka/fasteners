@@ -53,6 +53,18 @@ except ImportError:
 try:
     from fcntl import F_OFD_SETLK
     from fcntl import F_OFD_SETLKW
+    
+    try:
+        os.O_LARGEFILE
+    except AttributeError:
+        start_len = "ll"
+    else:
+        start_len = "qq"
+
+    _exclusive_type = struct.pack('hh' + start_len + 'hh', fcntl.F_WRLCK, 0, 0, 0, 0, 0)
+    _shared_type = struct.pack('hh' + start_len + 'hh', fcntl.F_RDLCK, 0, 0, 0, 0, 0)
+    _unlock_type = struct.pack('hh' + start_len + 'hh', fcntl.F_UNLCK, 0, 0, 0, 0, 0)
+    
 except ImportError:
     F_OFD_SETLK = None
     F_OFD_SETLKW = None
@@ -353,8 +365,6 @@ class LockFileExMechanism(FileLockingMechanism):
         length:
             Length (in bytes) of the byte range to lock (default=1)
         """
-        handle = msvcrt.get_osfhandle(handle.fileno())
-
         length_high = length >> 32
         length_low = length & 0xffffffff
 
@@ -470,16 +480,6 @@ class PythonFlockMechanism(FileLockingMechanism):
         fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-try:
-    os.O_LARGEFILE
-except AttributeError:
-    start_len = "ll"
-else:
-    start_len = "qq"
-
-_exclusive_type = struct.pack('hh' + start_len + 'hh', fcntl.F_WRLCK, 0, 0, 0, 0, 0)
-_shared_type = struct.pack('hh' + start_len + 'hh', fcntl.F_RDLCK, 0, 0, 0, 0, 0)
-_unlock_type = struct.pack('hh' + start_len + 'hh', fcntl.F_UNLCK, 0, 0, 0, 0, 0)
 
 
 class OpenMechanism(FileLockingMechanism):
