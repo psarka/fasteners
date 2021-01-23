@@ -12,7 +12,7 @@ from diskcache import Deque
 import more_itertools as mo
 import pytest
 
-from fasteners.process_lock import InterProcessReaderWriterLock as ReaderWriterLock
+from fasteners.lock.process_lock import InterProcessReaderWriterLock as ReaderWriterLock
 
 PROCESS_COUNT = 20
 

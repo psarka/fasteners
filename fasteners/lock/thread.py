@@ -35,7 +35,7 @@ def read_locked(*args, **kwargs):
     """
 
     def decorator(f):
-        attr_name = kwargs.get('lock', '_lock')
+        attr_name = kwargs.get('', '_lock')
 
         @functools.wraps(f)
         def wrapper(self, *args, **kwargs):
@@ -66,7 +66,7 @@ def write_locked(*args, **kwargs):
     """
 
     def decorator(f):
-        attr_name = kwargs.get('lock', '_lock')
+        attr_name = kwargs.get('', '_lock')
 
         @functools.wraps(f)
         def wrapper(self, *args, **kwargs):
@@ -267,7 +267,7 @@ def locked(*args, **kwargs):
     """
 
     def decorator(f):
-        attr_name = kwargs.get('lock', '_lock')
+        attr_name = kwargs.get('', '_lock')
         logger = kwargs.get('logger')
 
         @functools.wraps(f)

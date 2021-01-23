@@ -27,9 +27,9 @@ import time
 
 import pytest
 
-from fasteners import process_lock as pl
-from fasteners.process_lock import BaseInterProcessLock
-from fasteners.process_lock import FileLockingMechanism
+from fasteners.lock import process_lock as pl
+from fasteners.lock.process_lock import BaseInterProcessLock
+from fasteners.lock.process_lock import FileLockingMechanism
 
 WIN32 = os.name == 'nt'
 

@@ -19,39 +19,80 @@ from contextlib import contextmanager
 import errno
 import functools
 import logging
+import math
 import os
+from pathlib import Path
 import threading
 import time
 import warnings
 
 from fasteners import _utils
-from fasteners.file_locking_mechanism import FcntlMechanism
-from fasteners.file_locking_mechanism import FileLockingMechanism
-from fasteners.file_locking_mechanism import LockFileExMechanism
-from fasteners.file_locking_mechanism import MsvcrtMechanism
+from fasteners.mechanism.file import FcntlMechanism
+from fasteners.mechanism.file import FileLockingMechanism
+from fasteners.mechanism.file import LockFileExMechanism
+from fasteners.mechanism.file import MsvcrtMechanism
+from fasteners.mechanism.file import PythonFlockMechanism
+from fasteners.mechanism.file import OpenMechanism
 
 LOG = logging.getLogger(__name__)
 
 
-def _ensure_tree(path):
-    """Create a directory (and any ancestor directories required).
+class Backoff:
+    pass
 
-    :param path: Directory to create
-    """
-    try:
-        os.makedirs(path)
-    except OSError as e:
-        if e.errno == errno.EEXIST:
-            if not os.path.isdir(path):
-                raise
-            else:
-                return False
-        elif e.errno == errno.EISDIR:
-            return False
+
+class Linear:
+    def __init__(self, start, step, end):
+        self.start = start
+        self.step = step
+        self.end = end
+        self._duration = start - step
+
+    def wait_for(self):
+        self._duration = min(self.end, self._duration + self.step)
+        return self._duration
+
+
+class FcntlLock:
+
+    mechanism = FcntlMechanism
+
+    def __init__(self, path):
+        self.path = Path(path).resolve()
+        self.handle = None
+
+        assert self.mechanism.available
+
+    def acquire_read_lock(self,
+                          timeout: float = math.inf,
+                          backoff: Backoff = Linear(0.01, 0.01, 0.1)):
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+        if self.handle is None:
+            self.handle = open(self.path, 'a+')
+
+        if timeout == 0:
+            gotten = self.mechanism.lock(self.handle, exclusive=False, blocking=False)
+        elif timeout == math.inf:
+            gotten = self.mechanism.lock(self.handle, exclusive=False, blocking=True)
         else:
-            raise
-    else:
-        return True
+            gotten = False
+            for _ in time_something(backoff, timeout):
+                gotten = self.mechanism.lock(self.handle, exclusive=False, blocking=False)
+                if gotten:
+                    break
+
+        return gotten
+
+    def acquire_write_lock(self):
+        ...
+
+    def release_read_lock(self):
+        ...
+
+    def release_write_lock(self):
+        ...
 
 
 class BaseInterProcessLock(object):

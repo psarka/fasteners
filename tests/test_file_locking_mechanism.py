@@ -4,11 +4,11 @@ import time
 
 import pytest
 
-from fasteners.file_locking_mechanism import FcntlMechanism
-from fasteners.file_locking_mechanism import LockFileExMechanism
-from fasteners.file_locking_mechanism import MsvcrtMechanism
-from fasteners.file_locking_mechanism import OpenMechanism
-from fasteners.file_locking_mechanism import PythonFlockMechanism
+from fasteners.mechanism.file_locking_mechanism import FcntlMechanism
+from fasteners.mechanism.file_locking_mechanism import LockFileExMechanism
+from fasteners.mechanism.file_locking_mechanism import MsvcrtMechanism
+from fasteners.mechanism.file_locking_mechanism import OpenMechanism
+from fasteners.mechanism.file_locking_mechanism import PythonFlockMechanism
 from tests.process_tester import Tester
 
 mechanisms = [FcntlMechanism,
